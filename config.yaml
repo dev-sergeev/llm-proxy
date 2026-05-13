@@ -1,0 +1,13 @@
+model_list:
+  # Catch-all: любое имя модели на входе уезжает на один vLLM-бэкенд.
+  - model_name: "*"
+    litellm_params:
+      model: hosted_vllm/MODEL_PLACEHOLDER   # подставь имя, переданное в `vllm serve --model ...`
+      api_base: http://localhost:8000/v1
+
+litellm_settings:
+  # Закомментируй строку, чтобы выключить соответствующий компонент.
+  callbacks:
+    - custom_callbacks.request_modifier   # модификация запросов (system-промт, user-append)
+    - custom_callbacks.jsonl_logger       # запись logs/requests.jsonl
+  drop_params: true
