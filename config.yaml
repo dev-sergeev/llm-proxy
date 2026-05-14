@@ -9,5 +9,6 @@ litellm_settings:
   # Закомментируй строку, чтобы выключить соответствующий компонент.
   callbacks:
     - custom_callbacks.request_modifier   # модификация запросов (system-промт, user-append)
+    - custom_callbacks.reasoning_stripper # просьба обернуть reasoning в <reasoning>…</reasoning> + вырезание блока из ответа
     - custom_callbacks.jsonl_logger       # запись logs/requests.jsonl
   drop_params: true

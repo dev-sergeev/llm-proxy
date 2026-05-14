@@ -1,8 +1,9 @@
 # super_proxy
 
-LiteLLM proxy в роли OpenAI-совместимого шлюза с двумя независимыми дополнениями:
+LiteLLM proxy в роли OpenAI-совместимого шлюза с тремя независимыми дополнениями:
 1. **`RequestModifier`** — `async_pre_call_hook`, добавляет system-промт и при необходимости дополняет последнее user-сообщение.
-2. **`JsonlLogger`** — `async_log_success_event` / `async_log_failure_event`, пишет логи построчно в `logs/requests.jsonl`.
+2. **`ReasoningStripper`** — `async_pre_call_hook` + `async_post_call_success_hook`: просит модель оборачивать reasoning в XML-тег и вырезает этот блок из ответа перед отдачей клиенту.
+3. **`JsonlLogger`** — `async_log_success_event` / `async_log_failure_event`, пишет логи построчно в `logs/requests.jsonl`.
 
 Любое имя модели на входе (`model: "*"` в `config.yaml`) пересылается в один **hosted vLLM**-бэкенд. Каждый компонент включается/выключается отдельной строкой в `config.yaml` (`litellm_settings.callbacks`).
 
@@ -75,6 +76,15 @@ curl -s http://localhost:4000/v1/chat/completions \
 
 Подробнее про аргументы, передаваемые в хук — [docs/pre_call_hook_args.md](docs/pre_call_hook_args.md).
 
+## Reasoning-стриппер
+
+В `custom_callbacks.py`, секция «Удаление reasoning-тега из ответа модели»:
+
+- **`REASONING_TAG`** — имя XML-тега (по умолчанию `reasoning`).
+- **`REASONING_INSTRUCTION`** — текст, дописываемый в **конец** system-сообщения. Просит модель оборачивать chain-of-thought в `<reasoning>…</reasoning>`. Пустая строка — модель не инструктируется, но post-hook всё равно вырежет тег, если он встретится.
+
+После ответа модели регекспом удаляются **только закрытые** пары `<reasoning>…</reasoning>` (вместе с trailing whitespace, регистронезависимо). Незакрытые блоки (например, из-за обрезания по `max_tokens`) остаются нетронутыми, чтобы клиент мог их увидеть и обработать.
+
 ## Как отключить компонент
 
 В `config.yaml` закомментируй строку в `litellm_settings.callbacks`:
@@ -83,5 +93,6 @@ curl -s http://localhost:4000/v1/chat/completions \
 litellm_settings:
   callbacks:
     - custom_callbacks.request_modifier   # ← закомментируй, чтобы перестать менять запросы
+    - custom_callbacks.reasoning_stripper # ← закомментируй, чтобы перестать вырезать <reasoning>…</reasoning>
     - custom_callbacks.jsonl_logger       # ← закомментируй, чтобы перестать писать .jsonl
 ```
