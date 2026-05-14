@@ -103,6 +103,12 @@ _REASONING_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 
+# Матчит ТОЛЬКО закрытые пары <system-reminder>…</system-reminder>
+_SYSTEM_REMINDER_RE = re.compile(
+    r"<system-reminder\b[^>]*>.*?</system-reminder\s*>\s*",
+    re.DOTALL | re.IGNORECASE,
+)
+
 
 class ReasoningStripper(CustomLogger):
     async def async_pre_call_hook(
@@ -145,14 +151,27 @@ class ReasoningStripper(CustomLogger):
             content = user_msg.get("content")
 
             if isinstance(content, str):
-                # Convert string to content array
+                # Clean up any existing system-reminder blocks
+                cleaned = _SYSTEM_REMINDER_RE.sub("", content).strip()
+                # Convert to content array
                 user_msg["content"] = [
                     instruction_block,
-                    {"type": "text", "text": content}
+                    {"type": "text", "text": cleaned}
                 ]
             elif isinstance(content, list):
-                # Already a content array: prepend instruction block
-                user_msg["content"].insert(0, instruction_block)
+                # Remove any existing system-reminder blocks from content array
+                filtered_content = []
+                for block in content:
+                    if block.get("type") == "text":
+                        text = block.get("text", "")
+                        cleaned = _SYSTEM_REMINDER_RE.sub("", text).strip()
+                        if cleaned:
+                            filtered_content.append({"type": "text", "text": cleaned})
+                    else:
+                        filtered_content.append(block)
+
+                # Prepend instruction block
+                user_msg["content"] = [instruction_block] + filtered_content
             else:
                 # Unexpected content type, leave unchanged
                 pass

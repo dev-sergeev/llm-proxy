@@ -170,3 +170,74 @@ class TestReasoningStripperPreHook:
         # Should strip reasoning tags but keep the answer
         assert result.choices[0].message.content == "The answer is 42."
         assert "<reasoning>" not in result.choices[0].message.content
+
+    @pytest.mark.asyncio
+    async def test_cleanup_existing_system_reminder_in_string(self):
+        """Should remove existing system-reminder blocks before adding new one."""
+        old_reminder = "<system-reminder>Old instruction here</system-reminder>\n\nUser query"
+        data = {
+            "messages": [
+                {"role": "user", "content": old_reminder}
+            ]
+        }
+
+        result = await self.stripper.async_pre_call_hook(
+            user_api_key_dict=None,
+            cache=None,
+            data=data,
+            call_type="completion"
+        )
+
+        last_msg = result["messages"][-1]
+        content = last_msg["content"]
+
+        # Should have content array
+        assert isinstance(content, list)
+        # Should have exactly 2 blocks: new instruction + original query
+        assert len(content) == 2
+
+        # First block: new instruction
+        assert "<system-reminder>" in content[0]["text"]
+        # Second block: cleaned query (old reminder removed)
+        assert content[1]["text"] == "User query"
+        assert "<system-reminder>" not in content[1]["text"]
+
+    @pytest.mark.asyncio
+    async def test_cleanup_existing_system_reminder_in_array(self):
+        """Should remove existing system-reminder blocks from content arrays."""
+        data = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "<system-reminder>Old instruction</system-reminder>\n\nFirst part"},
+                        {"type": "image_url", "image_url": {"url": "https://example.com/img.png"}},
+                        {"type": "text", "text": "Final query"}
+                    ]
+                }
+            ]
+        }
+
+        result = await self.stripper.async_pre_call_hook(
+            user_api_key_dict=None,
+            cache=None,
+            data=data,
+            call_type="completion"
+        )
+
+        last_msg = result["messages"][-1]
+        content = last_msg["content"]
+
+        # Should have content array
+        assert isinstance(content, list)
+        # Should have: new instruction + original text blocks (old reminder removed) + image
+        assert len(content) == 4
+
+        # First block: new instruction
+        assert "<system-reminder>" in content[0]["text"]
+        # Second block: first text with old reminder removed
+        assert content[1]["text"] == "First part"
+        # Third block: image preserved
+        assert content[2]["type"] == "image_url"
+        # Fourth block: final query
+        assert content[3]["text"] == "Final query"
