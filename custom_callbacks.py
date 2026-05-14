@@ -97,17 +97,19 @@ REASONING_INSTRUCTION = (
     "the user will see."
 ).format(tag=REASONING_TAG)
 
-# Матчит ТОЛЬКО закрытые пары <reasoning>…</reasoning> — незакрытые блоки остаются как есть.
-_REASONING_RE = re.compile(
-    rf"<{REASONING_TAG}\b[^>]*>.*?</{REASONING_TAG}\s*>\s*",
-    re.DOTALL | re.IGNORECASE,
-)
+def _xml_tag_re(tag: str) -> re.Pattern:
+    return re.compile(
+        rf"<{re.escape(tag)}\b[^>]*>.*?</{re.escape(tag)}\s*>\s*",
+        re.DOTALL | re.IGNORECASE,
+    )
 
-# Матчит ТОЛЬКО закрытые пары <system-reminder>…</system-reminder>
-_SYSTEM_REMINDER_RE = re.compile(
-    r"<system-reminder\b[^>]*>.*?</system-reminder\s*>\s*",
-    re.DOTALL | re.IGNORECASE,
-)
+
+_REASONING_RE = _xml_tag_re(REASONING_TAG)
+_SYSTEM_REMINDER_RE = _xml_tag_re("system-reminder")
+
+# Constant block prepended to user messages (built once, used many times)
+_SYSTEM_REMINDER_BLOCK_TEXT = f"<system-reminder>{REASONING_INSTRUCTION}</system-reminder>\n\n"
+_INSTRUCTION_BLOCK = {"type": "text", "text": _SYSTEM_REMINDER_BLOCK_TEXT}
 
 
 class ReasoningStripper(CustomLogger):
@@ -125,37 +127,33 @@ class ReasoningStripper(CustomLogger):
             "audio_transcription",
         ],
     ) -> Optional[dict]:
-        if call_type not in ("completion", "text_completion"):
-            return data
         if not REASONING_INSTRUCTION:
+            return data
+        if call_type not in ("completion", "text_completion"):
             return data
 
         messages = data.get("messages") or []
 
         # Find the last user message
-        last_user_idx = None
-        for i in range(len(messages) - 1, -1, -1):
-            if messages[i].get("role") == "user":
-                last_user_idx = i
-                break
-
-        # Prepare the instruction block with system-reminder tags
-        instruction_block = {
-            "type": "text",
-            "text": f"<system-reminder>{REASONING_INSTRUCTION}</system-reminder>\n\n"
-        }
+        last_user_idx = next(
+            (i for i in range(len(messages) - 1, -1, -1)
+             if messages[i].get("role") == "user"),
+            None,
+        )
 
         if last_user_idx is not None:
-            # Last user message exists: prepend instruction to it
             user_msg = messages[last_user_idx]
             content = user_msg.get("content")
 
             if isinstance(content, str):
-                # Clean up any existing system-reminder blocks
-                cleaned = _SYSTEM_REMINDER_RE.sub("", content).strip()
+                # Only apply regex if system-reminder tag is present
+                if "<system-reminder>" in content:
+                    cleaned = _SYSTEM_REMINDER_RE.sub("", content).strip()
+                else:
+                    cleaned = content.strip()
                 # Convert to content array
                 user_msg["content"] = [
-                    instruction_block,
+                    _INSTRUCTION_BLOCK,
                     {"type": "text", "text": cleaned}
                 ]
             elif isinstance(content, list):
@@ -164,22 +162,22 @@ class ReasoningStripper(CustomLogger):
                 for block in content:
                     if block.get("type") == "text":
                         text = block.get("text", "")
-                        cleaned = _SYSTEM_REMINDER_RE.sub("", text).strip()
-                        if cleaned:
-                            filtered_content.append({"type": "text", "text": cleaned})
+                        if "<system-reminder>" in text:
+                            cleaned = _SYSTEM_REMINDER_RE.sub("", text).strip()
+                            if cleaned:
+                                filtered_content.append({"type": "text", "text": cleaned})
+                        else:
+                            filtered_content.append(block)
                     else:
                         filtered_content.append(block)
 
                 # Prepend instruction block
-                user_msg["content"] = [instruction_block] + filtered_content
-            else:
-                # Unexpected content type, leave unchanged
-                pass
+                user_msg["content"] = [_INSTRUCTION_BLOCK] + filtered_content
         else:
             # No user message: create one with just the instruction
             messages.append({
                 "role": "user",
-                "content": [instruction_block]
+                "content": [_INSTRUCTION_BLOCK]
             })
 
         data["messages"] = messages
