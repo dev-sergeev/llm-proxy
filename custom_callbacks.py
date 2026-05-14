@@ -125,16 +125,43 @@ class ReasoningStripper(CustomLogger):
             return data
 
         messages = data.get("messages") or []
-        sys_idx = next(
-            (i for i, m in enumerate(messages) if m.get("role") == "system"),
-            None,
-        )
-        if sys_idx is None:
-            messages.insert(0, {"role": "system", "content": REASONING_INSTRUCTION})
+
+        # Find the last user message
+        last_user_idx = None
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                last_user_idx = i
+                break
+
+        # Prepare the instruction block with system-reminder tags
+        instruction_block = {
+            "type": "text",
+            "text": f"<system-reminder>{REASONING_INSTRUCTION}</system-reminder>\n\n"
+        }
+
+        if last_user_idx is not None:
+            # Last user message exists: prepend instruction to it
+            user_msg = messages[last_user_idx]
+            content = user_msg.get("content")
+
+            if isinstance(content, str):
+                # Convert string to content array
+                user_msg["content"] = [
+                    instruction_block,
+                    {"type": "text", "text": content}
+                ]
+            elif isinstance(content, list):
+                # Already a content array: prepend instruction block
+                user_msg["content"].insert(0, instruction_block)
+            else:
+                # Unexpected content type, leave unchanged
+                pass
         else:
-            existing = messages[sys_idx].get("content") or ""
-            separator = "\n\n" if existing else ""
-            messages[sys_idx]["content"] = existing + separator + REASONING_INSTRUCTION
+            # No user message: create one with just the instruction
+            messages.append({
+                "role": "user",
+                "content": [instruction_block]
+            })
 
         data["messages"] = messages
         return data
