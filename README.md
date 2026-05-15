@@ -2,7 +2,7 @@
 
 LiteLLM proxy в роли OpenAI-совместимого шлюза с тремя независимыми дополнениями:
 1. **`RequestModifier`** — `async_pre_call_hook`, добавляет system-промт и при необходимости дополняет последнее user-сообщение.
-2. **`ReasoningStripper`** — `async_pre_call_hook` + `async_post_call_success_hook`: просит модель оборачивать reasoning в XML-тег и вырезает этот блок из ответа перед отдачей клиенту.
+2. **`ReasoningStripper`** — `async_pre_call_hook` + `async_post_call_success_hook` + `async_post_call_streaming_iterator_hook`: просит модель оборачивать reasoning в XML-тег и вырезает этот блок из non-streaming и streaming-ответов перед отдачей клиенту.
 3. **`JsonlLogger`** — `async_log_success_event` / `async_log_failure_event`, пишет логи построчно в `logs/requests.jsonl`.
 
 Любое имя модели на входе (`model: "*"` в `config.yaml`) пересылается в один **hosted vLLM**-бэкенд. Каждый компонент включается/выключается отдельной строкой в `config.yaml` (`litellm_settings.callbacks`).
