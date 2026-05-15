@@ -223,14 +223,20 @@ _INSTRUCTION_BLOCK = {"type": "text", "text": _SYSTEM_REMINDER_BLOCK_TEXT}
 
 
 def _stream_choice_index(choice: Any, fallback: int) -> int:
-    index = getattr(choice, "index", fallback)
+    if isinstance(choice, dict):
+        index = choice.get("index", fallback)
+    else:
+        index = getattr(choice, "index", fallback)
     if isinstance(index, int):
         return index
     return fallback
 
 
 def _get_delta_content(choice: Any) -> Optional[str]:
-    delta = getattr(choice, "delta", None)
+    if isinstance(choice, dict):
+        delta = choice.get("delta")
+    else:
+        delta = getattr(choice, "delta", None)
     if isinstance(delta, dict):
         content = delta.get("content")
     else:
@@ -240,14 +246,37 @@ def _get_delta_content(choice: Any) -> Optional[str]:
     return None
 
 
+def _can_set_delta_content(choice: Any) -> bool:
+    if isinstance(choice, dict):
+        return isinstance(choice.get("delta"), dict)
+    return getattr(choice, "delta", None) is not None
+
+
 def _set_delta_content(choice: Any, content: str) -> None:
-    delta = getattr(choice, "delta", None)
+    if isinstance(choice, dict):
+        delta = choice.get("delta")
+    else:
+        delta = getattr(choice, "delta", None)
     if delta is None:
         return
     if isinstance(delta, dict):
         delta["content"] = content
         return
     setattr(delta, "content", content)
+
+
+def _try_set_delta_content(choice: Any, content: str) -> bool:
+    try:
+        _set_delta_content(choice, content)
+    except Exception:
+        return False
+    return True
+
+
+def _get_finish_reason(choice: Any) -> Any:
+    if isinstance(choice, dict):
+        return choice.get("finish_reason")
+    return getattr(choice, "finish_reason", None)
 
 
 class ReasoningStripper(CustomLogger):
@@ -343,28 +372,37 @@ class ReasoningStripper(CustomLogger):
         filters: dict[int, ReasoningStreamFilter] = {}
 
         async for chunk in response:
-            try:
-                choices = getattr(chunk, "choices", None) or []
-                for position, choice in enumerate(choices):
+            choices = getattr(chunk, "choices", None) or []
+            for position, choice in enumerate(choices):
+                try:
                     choice_index = _stream_choice_index(choice, position)
-                    stream_filter = filters.setdefault(
-                        choice_index,
-                        ReasoningStreamFilter(REASONING_TAG),
-                    )
-
                     content = _get_delta_content(choice)
-                    if content is not None:
-                        _set_delta_content(choice, stream_filter.feed(content))
+                    finish_reason = _get_finish_reason(choice)
+                    can_write_content = _can_set_delta_content(choice)
+                except Exception:
+                    continue
 
-                    if getattr(choice, "finish_reason", None) is not None:
-                        tail = stream_filter.flush()
-                        if tail:
-                            current = _get_delta_content(choice) or ""
-                            _set_delta_content(choice, current + tail)
+                stream_filter = filters.setdefault(
+                    choice_index,
+                    ReasoningStreamFilter(REASONING_TAG),
+                )
+
+                if content is not None:
+                    if not can_write_content:
+                        continue
+                    if not _try_set_delta_content(choice, ""):
+                        continue
+                    filtered_content = stream_filter.feed(content)
+                    _try_set_delta_content(choice, filtered_content)
+
+                if finish_reason is not None:
+                    if can_write_content:
+                        current = _get_delta_content(choice) or ""
+                        if _try_set_delta_content(choice, current):
+                            tail = stream_filter.flush()
+                            if tail:
+                                _try_set_delta_content(choice, current + tail)
                         filters.pop(choice_index, None)
-            except Exception:
-                yield chunk
-                continue
 
             yield chunk
 

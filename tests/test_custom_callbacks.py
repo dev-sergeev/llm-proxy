@@ -39,7 +39,16 @@ async def _collect_streaming_hook(stripper, chunks):
 
 
 def _chunk_content(chunk):
-    return getattr(chunk.choices[0].delta, "content", None)
+    choice = chunk.choices[0]
+    if isinstance(choice, dict):
+        return choice.get("delta", {}).get("content")
+    return getattr(choice.delta, "content", None)
+
+
+def _choice_content(choice):
+    if isinstance(choice, dict):
+        return choice.get("delta", {}).get("content")
+    return getattr(choice.delta, "content", None)
 
 
 class TestReasoningStripperPreHook:
@@ -416,3 +425,73 @@ class TestReasoningStripperStreamingHook:
 
         assert "".join(_chunk_content(chunk) or "" for chunk in result) == "Literal <rea"
         assert result[-1].choices[0].finish_reason == "stop"
+
+    @pytest.mark.asyncio
+    async def test_streaming_hook_strips_dict_shaped_choice_delta(self):
+        chunks = [
+            SimpleNamespace(
+                choices=[
+                    {
+                        "index": 0,
+                        "delta": {
+                            "content": "<reasoning>x</reasoning>Visible",
+                        },
+                    }
+                ]
+            ),
+            SimpleNamespace(choices=[{"index": 0, "delta": {}, "finish_reason": "stop"}]),
+        ]
+
+        result = await _collect_streaming_hook(self.stripper, chunks)
+
+        assert "".join(_chunk_content(chunk) or "" for chunk in result) == "Visible"
+        assert result[-1].choices[0]["finish_reason"] == "stop"
+
+    @pytest.mark.asyncio
+    async def test_streaming_hook_preserves_role_only_chunk_without_content(self):
+        chunks = [
+            _stream_chunk(role="assistant"),
+            _stream_chunk("Visible"),
+            _stream_chunk(finish_reason="stop"),
+        ]
+
+        result = await _collect_streaming_hook(self.stripper, chunks)
+
+        assert getattr(result[0].choices[0].delta, "role", None) == "assistant"
+        assert not hasattr(result[0].choices[0].delta, "content")
+        assert "".join(_chunk_content(chunk) or "" for chunk in result) == "Visible"
+
+    @pytest.mark.asyncio
+    async def test_streaming_hook_keeps_separate_state_per_choice_index(self):
+        chunks = [
+            SimpleNamespace(
+                choices=[
+                    {"index": 0, "delta": {"content": "<rea"}},
+                    {"index": 1, "delta": {"content": "Alpha "}},
+                ]
+            ),
+            SimpleNamespace(
+                choices=[
+                    {"index": 1, "delta": {"content": "Beta"}},
+                    {
+                        "index": 0,
+                        "delta": {"content": "soning>hidden</reasoning>Visible"},
+                    },
+                ]
+            ),
+            SimpleNamespace(
+                choices=[
+                    {"index": 0, "delta": {}, "finish_reason": "stop"},
+                    {"index": 1, "delta": {}, "finish_reason": "stop"},
+                ]
+            ),
+        ]
+
+        result = await _collect_streaming_hook(self.stripper, chunks)
+        contents_by_index = {0: [], 1: []}
+        for chunk in result:
+            for choice in chunk.choices:
+                contents_by_index[choice["index"]].append(_choice_content(choice) or "")
+
+        assert "".join(contents_by_index[0]) == "Visible"
+        assert "".join(contents_by_index[1]) == "Alpha Beta"
