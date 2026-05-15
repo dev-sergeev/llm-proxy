@@ -152,9 +152,9 @@ class ReasoningStreamFilter:
 
             if self._drop_leading_ws:
                 self._buffer = self._buffer.lstrip()
-                self._drop_leading_ws = False
                 if not self._buffer:
                     break
+                self._drop_leading_ws = False
 
             opening_match = self._opening_re.search(self._buffer)
             if opening_match is None:

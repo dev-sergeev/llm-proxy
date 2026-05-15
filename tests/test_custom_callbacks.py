@@ -309,3 +309,13 @@ class TestReasoningStreamFilter:
         visible += stream_filter.flush()
 
         assert visible == "alpha beta"
+
+    def test_suppresses_initial_whitespace_split_across_chunks(self):
+        stream_filter = ReasoningStreamFilter("reasoning")
+
+        visible = stream_filter.feed("<reasoning>private notes</reasoning>")
+        visible += stream_filter.feed("\n")
+        visible += stream_filter.feed("\nThe answer is 42.")
+        visible += stream_filter.flush()
+
+        assert visible == "The answer is 42."
