@@ -1,6 +1,12 @@
 import pytest
+from types import SimpleNamespace
 from unittest.mock import MagicMock
-from custom_callbacks import ReasoningStripper, REASONING_INSTRUCTION
+
+from custom_callbacks import (
+    ReasoningStreamFilter,
+    ReasoningStripper,
+    REASONING_INSTRUCTION,
+)
 
 
 class TestReasoningStripperPreHook:
@@ -241,3 +247,57 @@ class TestReasoningStripperPreHook:
         assert content[2]["type"] == "image_url"
         # Fourth block: final query
         assert content[3]["text"] == "Final query"
+
+
+class TestReasoningStreamFilter:
+    def test_removes_reasoning_when_tags_are_in_one_chunk(self):
+        stream_filter = ReasoningStreamFilter("reasoning")
+
+        visible = stream_filter.feed(
+            "<reasoning>private notes</reasoning>\n\nThe answer is 42."
+        )
+        visible += stream_filter.flush()
+
+        assert visible == "The answer is 42."
+
+    def test_removes_reasoning_when_tags_are_split_across_chunks(self):
+        stream_filter = ReasoningStreamFilter("reasoning")
+        visible_parts = []
+
+        for fragment in [
+            "<rea",
+            "soning>private",
+            " notes</rea",
+            "soning>\n\nThe answer",
+            " is 42.",
+        ]:
+            visible_parts.append(stream_filter.feed(fragment))
+        visible_parts.append(stream_filter.flush())
+
+        assert "".join(visible_parts) == "The answer is 42."
+
+    def test_passes_through_text_when_no_reasoning_tag_exists(self):
+        stream_filter = ReasoningStreamFilter("reasoning")
+
+        visible = stream_filter.feed("Hello ")
+        visible += stream_filter.feed("world")
+        visible += stream_filter.flush()
+
+        assert visible == "Hello world"
+
+    def test_drops_unclosed_reasoning_block_on_flush(self):
+        stream_filter = ReasoningStreamFilter("reasoning")
+
+        visible = stream_filter.feed("<reasoning>private notes")
+        visible += stream_filter.feed(" still private")
+        visible += stream_filter.flush()
+
+        assert visible == ""
+
+    def test_flush_releases_held_partial_tag_outside_reasoning(self):
+        stream_filter = ReasoningStreamFilter("reasoning")
+
+        visible = stream_filter.feed("Literal <rea")
+        visible += stream_filter.flush()
+
+        assert visible == "Literal <rea"

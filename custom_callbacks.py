@@ -3,7 +3,7 @@ import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Any, AsyncGenerator, Literal, Optional
 
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.proxy.proxy_server import DualCache, UserAPIKeyAuth
@@ -104,13 +104,113 @@ def _xml_tag_re(tag: str) -> re.Pattern:
     )
 
 
+def _partial_tag_suffix_len(text: str, marker: str) -> int:
+    lower_text = text.lower()
+    max_len = min(len(lower_text), len(marker))
+    for size in range(max_len, 0, -1):
+        if marker.startswith(lower_text[-size:]):
+            return size
+    return 0
+
+
+class ReasoningStreamFilter:
+    def __init__(self, tag: str) -> None:
+        escaped_tag = re.escape(tag)
+        self._opening_re = re.compile(
+            rf"<{escaped_tag}\b[^>]*>",
+            re.IGNORECASE,
+        )
+        self._closing_re = re.compile(
+            rf"</{escaped_tag}\s*>",
+            re.IGNORECASE,
+        )
+        self._opening_marker = f"<{tag.lower()}"
+        self._closing_marker = f"</{tag.lower()}"
+        self._buffer = ""
+        self._inside_reasoning = False
+        self._drop_leading_ws = False
+
+    def feed(self, text: str) -> str:
+        if not text:
+            return ""
+
+        self._buffer += text
+        visible_parts = []
+
+        while self._buffer:
+            if self._inside_reasoning:
+                closing_match = self._closing_re.search(self._buffer)
+                if closing_match is None:
+                    self._buffer = self._inside_pending_suffix()
+                    break
+
+                self._buffer = self._buffer[closing_match.end():]
+                self._inside_reasoning = False
+                self._drop_leading_ws = True
+                continue
+
+            if self._drop_leading_ws:
+                self._buffer = self._buffer.lstrip()
+                self._drop_leading_ws = False
+                if not self._buffer:
+                    break
+
+            opening_match = self._opening_re.search(self._buffer)
+            if opening_match is None:
+                visible, self._buffer = self._outside_visible_prefix()
+                visible_parts.append(visible)
+                break
+
+            visible_parts.append(self._buffer[:opening_match.start()])
+            self._buffer = self._buffer[opening_match.end():]
+            self._inside_reasoning = True
+
+        return "".join(visible_parts)
+
+    def flush(self) -> str:
+        if self._inside_reasoning:
+            self._buffer = ""
+            self._inside_reasoning = False
+            self._drop_leading_ws = False
+            return ""
+
+        if self._drop_leading_ws:
+            self._buffer = self._buffer.lstrip()
+            self._drop_leading_ws = False
+
+        visible = self._buffer
+        self._buffer = ""
+        return visible
+
+    def _inside_pending_suffix(self) -> str:
+        lower_buffer = self._buffer.lower()
+        marker_idx = lower_buffer.rfind(self._closing_marker)
+        if marker_idx != -1:
+            return self._buffer[marker_idx:]
+
+        keep_len = _partial_tag_suffix_len(self._buffer, self._closing_marker)
+        if keep_len:
+            return self._buffer[-keep_len:]
+        return ""
+
+    def _outside_visible_prefix(self) -> tuple[str, str]:
+        lower_buffer = self._buffer.lower()
+        marker_idx = lower_buffer.rfind(self._opening_marker)
+        if marker_idx != -1:
+            return self._buffer[:marker_idx], self._buffer[marker_idx:]
+
+        keep_len = _partial_tag_suffix_len(self._buffer, self._opening_marker)
+        if keep_len:
+            return self._buffer[:-keep_len], self._buffer[-keep_len:]
+        return self._buffer, ""
+
+
 _REASONING_RE = _xml_tag_re(REASONING_TAG)
 _SYSTEM_REMINDER_RE = _xml_tag_re("system-reminder")
 
 # Constant block prepended to user messages (built once, used many times)
 _SYSTEM_REMINDER_BLOCK_TEXT = f"<system-reminder>{REASONING_INSTRUCTION}</system-reminder>\n\n"
 _INSTRUCTION_BLOCK = {"type": "text", "text": _SYSTEM_REMINDER_BLOCK_TEXT}
-
 
 class ReasoningStripper(CustomLogger):
     async def async_pre_call_hook(
