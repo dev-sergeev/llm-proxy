@@ -231,6 +231,45 @@ class TestReasoningStripperPreHook:
         assert "<reasoning>" not in result.choices[0].message.content
 
     @pytest.mark.asyncio
+    async def test_post_hook_drops_unclosed_reasoning_block(self):
+        mock_response = MagicMock()
+        mock_choice = MagicMock()
+        mock_message = MagicMock()
+        mock_message.content = "<reasoning>private notes that never close"
+        mock_choice.message = mock_message
+        mock_response.choices = [mock_choice]
+
+        result = await self.stripper.async_post_call_success_hook(
+            data={},
+            user_api_key_dict=None,
+            response=mock_response,
+        )
+
+        assert result.choices[0].message.content == ""
+
+    @pytest.mark.asyncio
+    async def test_post_hook_strips_multiple_reasoning_blocks(self):
+        mock_response = MagicMock()
+        mock_choice = MagicMock()
+        mock_message = MagicMock()
+        mock_message.content = (
+            "<reasoning>first private block</reasoning>\n\n"
+            "Visible one. "
+            "<reasoning>second private block</reasoning>\n\n"
+            "Visible two."
+        )
+        mock_choice.message = mock_message
+        mock_response.choices = [mock_choice]
+
+        result = await self.stripper.async_post_call_success_hook(
+            data={},
+            user_api_key_dict=None,
+            response=mock_response,
+        )
+
+        assert result.choices[0].message.content == "Visible one. Visible two."
+
+    @pytest.mark.asyncio
     async def test_cleanup_existing_system_reminder_in_string(self):
         """Should remove existing system-reminder blocks before adding new one."""
         old_reminder = "<system-reminder>Old instruction here</system-reminder>\n\nUser query"

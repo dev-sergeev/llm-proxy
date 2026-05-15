@@ -215,7 +215,16 @@ class ReasoningStreamFilter:
 
 
 _REASONING_RE = _xml_tag_re(REASONING_TAG)
+_UNCLOSED_REASONING_RE = re.compile(
+    rf"<{re.escape(REASONING_TAG)}\b[^>]*>.*\Z",
+    re.DOTALL | re.IGNORECASE,
+)
 _SYSTEM_REMINDER_RE = _xml_tag_re("system-reminder")
+
+
+def _strip_reasoning_text(content: str) -> str:
+    return _UNCLOSED_REASONING_RE.sub("", _REASONING_RE.sub("", content))
+
 
 # Constant block prepended to user messages (built once, used many times)
 _SYSTEM_REMINDER_BLOCK_TEXT = f"<system-reminder>{REASONING_INSTRUCTION}</system-reminder>\n\n"
@@ -360,7 +369,7 @@ class ReasoningStripper(CustomLogger):
             message = getattr(choice, "message", None)
             content = getattr(message, "content", None)
             if isinstance(content, str):
-                message.content = _REASONING_RE.sub("", content)
+                message.content = _strip_reasoning_text(content)
         return response
 
     async def async_post_call_streaming_iterator_hook(
