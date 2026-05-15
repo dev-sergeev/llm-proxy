@@ -3,6 +3,7 @@ import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, AsyncGenerator, Iterable, Literal, Optional
 
 from litellm.integrations.custom_logger import CustomLogger
@@ -21,6 +22,8 @@ SYSTEM_PROMPT_DEFAULT = ""
 # Пустая строка — функция выключена.
 USER_PROMPT_APPEND = ""
 
+_TARGET_REASONING_CALL_TYPES = {"completion", "text_completion", "acompletion"}
+
 
 class RequestModifier(CustomLogger):
     async def async_pre_call_hook(
@@ -30,6 +33,7 @@ class RequestModifier(CustomLogger):
         data: dict,
         call_type: Literal[
             "completion",
+            "acompletion",
             "text_completion",
             "embeddings",
             "image_generation",
@@ -37,7 +41,7 @@ class RequestModifier(CustomLogger):
             "audio_transcription",
         ],
     ) -> Optional[dict]:
-        if call_type not in ("completion", "text_completion"):
+        if call_type not in _TARGET_REASONING_CALL_TYPES:
             return data
 
         messages = data.get("messages") or []
@@ -51,14 +55,26 @@ class RequestModifier(CustomLogger):
                 messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT_DEFAULT})
             else:
                 existing = messages[sys_idx].get("content") or ""
-                separator = "\n\n" if existing else ""
-                messages[sys_idx]["content"] = SYSTEM_PROMPT_DEFAULT + separator + existing
+                if isinstance(existing, list):
+                    messages[sys_idx]["content"] = [
+                        {"type": "text", "text": SYSTEM_PROMPT_DEFAULT}
+                    ] + existing
+                else:
+                    separator = "\n\n" if existing else ""
+                    messages[sys_idx]["content"] = SYSTEM_PROMPT_DEFAULT + separator + existing
 
         if USER_PROMPT_APPEND:
             for m in reversed(messages):
                 if m.get("role") == "user":
-                    m["content"] = (m.get("content") or "") + USER_PROMPT_APPEND
+                    content = m.get("content")
+                    if isinstance(content, list):
+                        m["content"] = content + [{"type": "text", "text": USER_PROMPT_APPEND}]
+                    else:
+                        m["content"] = (content or "") + USER_PROMPT_APPEND
                     break
+
+        if REASONING_INSTRUCTION:
+            _inject_reasoning_reminder(messages)
 
         data["messages"] = messages
         return data
@@ -68,14 +84,14 @@ request_modifier = RequestModifier()
 
 
 # =====================================================================
-# Удаление reasoning-тега из ответа модели
-# (async_pre_call_hook добавляет инструкцию, async_post_call_success_hook чистит)
+# Reasoning instruction + удаление reasoning-тега из ответа модели
 # =====================================================================
 
 # Имя XML-тега, в который просим модель оборачивать reasoning.
 REASONING_TAG = "reasoning"
 
-# Текст, добавляемый в КОНЕЦ system-сообщения. Пустая строка — функция выключена.
+# Текст reasoning-протокола, внедряемый в последнее user-сообщение.
+# Пустая строка — reasoning injection выключен.
 REASONING_INSTRUCTION = (
     f"You MUST begin every response with an internal reasoning block wrapped in "
     f"<{REASONING_TAG}>...</{REASONING_TAG}> XML tags, placed BEFORE your final answer. "
@@ -225,6 +241,7 @@ _UNCLOSED_REASONING_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 _SYSTEM_REMINDER_RE = _xml_tag_re("system-reminder")
+_LEADING_REMINDER_SEPARATOR_RE = re.compile(r"^(?:\r?\n){2}")
 _REASONING_OPENING_START_RE = re.compile(
     rf"\A\s*<{re.escape(REASONING_TAG)}\b[^>]*>",
     re.DOTALL | re.IGNORECASE,
@@ -242,6 +259,61 @@ def _strip_reasoning_text(content: str) -> str:
 # Constant block prepended to user messages (built once, used many times)
 _SYSTEM_REMINDER_BLOCK_TEXT = f"<system-reminder>{REASONING_INSTRUCTION}</system-reminder>\n\n"
 _INSTRUCTION_BLOCK = {"type": "text", "text": _SYSTEM_REMINDER_BLOCK_TEXT}
+
+
+def _clean_system_reminder_text(text: str) -> str:
+    cleaned = _SYSTEM_REMINDER_RE.sub("", text)
+    return _LEADING_REMINDER_SEPARATOR_RE.sub("", cleaned, count=1)
+
+
+def _inject_reasoning_reminder_into_string(content: str) -> str:
+    cleaned = _clean_system_reminder_text(content)
+    if cleaned:
+        return _SYSTEM_REMINDER_BLOCK_TEXT + cleaned
+    return _SYSTEM_REMINDER_BLOCK_TEXT.rstrip()
+
+
+def _inject_reasoning_reminder_into_blocks(
+    content: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    filtered_content = []
+    for block in content:
+        if not isinstance(block, dict):
+            filtered_content.append(block)
+            continue
+        if block.get("type") != "text":
+            filtered_content.append(block)
+            continue
+
+        cleaned = _clean_system_reminder_text(block.get("text", ""))
+        if cleaned:
+            filtered_content.append({**block, "text": cleaned})
+
+    return [_INSTRUCTION_BLOCK.copy()] + filtered_content
+
+
+def _inject_reasoning_reminder(messages: list[dict[str, Any]]) -> None:
+    last_user_idx = next(
+        (i for i in range(len(messages) - 1, -1, -1) if messages[i].get("role") == "user"),
+        None,
+    )
+
+    if last_user_idx is None:
+        messages.append(
+            {
+                "role": "user",
+                "content": _SYSTEM_REMINDER_BLOCK_TEXT.rstrip(),
+            }
+        )
+        return
+
+    user_msg = messages[last_user_idx]
+    content = user_msg.get("content")
+
+    if isinstance(content, list):
+        user_msg["content"] = _inject_reasoning_reminder_into_blocks(content)
+    else:
+        user_msg["content"] = _inject_reasoning_reminder_into_string(content or "")
 
 
 def _stream_choice_index(choice: Any, fallback: int) -> int:
@@ -313,6 +385,21 @@ def _try_ensure_dict_delta_content(choice: Any, content: str) -> bool:
     return True
 
 
+def _try_ensure_delta_content(choice: Any, content: str) -> bool:
+    if isinstance(choice, dict):
+        return _try_ensure_dict_delta_content(choice, content)
+
+    delta = getattr(choice, "delta", None)
+    if delta is None:
+        try:
+            setattr(choice, "delta", SimpleNamespace(content=content))
+        except Exception:
+            return False
+        return True
+
+    return _try_set_delta_content(choice, content)
+
+
 def _get_finish_reason(choice: Any) -> Any:
     if isinstance(choice, dict):
         return choice.get("finish_reason")
@@ -362,6 +449,7 @@ class ReasoningStripper(CustomLogger):
         data: dict,
         call_type: Literal[
             "completion",
+            "acompletion",
             "text_completion",
             "embeddings",
             "image_generation",
@@ -369,56 +457,6 @@ class ReasoningStripper(CustomLogger):
             "audio_transcription",
         ],
     ) -> Optional[dict]:
-        if not REASONING_INSTRUCTION:
-            return data
-        if call_type not in ("completion", "text_completion"):
-            return data
-
-        messages = data.get("messages") or []
-
-        # Find the last user message
-        last_user_idx = next(
-            (i for i in range(len(messages) - 1, -1, -1)
-             if messages[i].get("role") == "user"),
-            None,
-        )
-
-        if last_user_idx is not None:
-            user_msg = messages[last_user_idx]
-            content = user_msg.get("content")
-
-            if isinstance(content, str):
-                cleaned = _SYSTEM_REMINDER_RE.sub("", content).strip()
-                # Convert to content array
-                user_msg["content"] = [
-                    _INSTRUCTION_BLOCK,
-                    {"type": "text", "text": cleaned}
-                ]
-            elif isinstance(content, list):
-                # Remove any existing system-reminder blocks from content array
-                filtered_content = []
-                for block in content:
-                    if block.get("type") == "text":
-                        text = block.get("text", "")
-                        cleaned = _SYSTEM_REMINDER_RE.sub("", text).strip()
-                        if cleaned != text.strip():
-                            if cleaned:
-                                filtered_content.append({"type": "text", "text": cleaned})
-                        elif text:
-                            filtered_content.append(block)
-                    else:
-                        filtered_content.append(block)
-
-                # Prepend instruction block
-                user_msg["content"] = [_INSTRUCTION_BLOCK] + filtered_content
-        else:
-            # No user message: create one with just the instruction
-            messages.append({
-                "role": "user",
-                "content": [_INSTRUCTION_BLOCK]
-            })
-
-        data["messages"] = messages
         return data
 
     async def async_post_call_success_hook(
@@ -476,7 +514,7 @@ class ReasoningStripper(CustomLogger):
                         if can_write_content:
                             _try_set_delta_content(choice, current + tail)
                         else:
-                            _try_ensure_dict_delta_content(choice, current + tail)
+                            _try_ensure_delta_content(choice, current + tail)
                     filters.pop(choice_index, None)
 
             yield chunk

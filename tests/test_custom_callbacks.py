@@ -1,11 +1,14 @@
+from copy import deepcopy
+
 import pytest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from custom_callbacks import (
+    RequestModifier,
+    REASONING_INSTRUCTION,
     ReasoningStreamFilter,
     ReasoningStripper,
-    REASONING_INSTRUCTION,
 )
 
 
@@ -62,149 +65,229 @@ class _ChoiceWithBrokenFinishReason:
         raise RuntimeError("finish reason unavailable")
 
 
-class TestReasoningStripperPreHook:
-    """Test ReasoningStripper.async_pre_call_hook message transformation."""
-
+class TestRequestModifierReasoningInjection:
     def setup_method(self):
-        self.stripper = ReasoningStripper()
+        self.modifier = RequestModifier()
 
     @pytest.mark.asyncio
-    async def test_prepend_instruction_to_string_user_message(self):
-        """When last message is a user string, prepend instruction in content array."""
+    async def test_injects_reasoning_reminder_into_string_user_message_for_acompletion(
+        self,
+    ):
         data = {
             "messages": [
                 {"role": "system", "content": "You are helpful."},
-                {"role": "user", "content": "What is 2+2?"}
+                {"role": "user", "content": "What is 2+2?"},
             ]
         }
 
-        result = await self.stripper.async_pre_call_hook(
+        result = await self.modifier.async_pre_call_hook(
             user_api_key_dict=None,
             cache=None,
-            data=data,
-            call_type="completion"
+            data=deepcopy(data),
+            call_type="acompletion",
         )
 
-        # Last message should now be content array
         last_msg = result["messages"][-1]
         assert last_msg["role"] == "user"
-        assert isinstance(last_msg["content"], list)
-        assert len(last_msg["content"]) == 2
-
-        # First block should have wrapped instruction
-        assert last_msg["content"][0]["type"] == "text"
-        assert "<system-reminder>" in last_msg["content"][0]["text"]
-        assert "You MUST begin every response" in last_msg["content"][0]["text"]
-        assert "</system-reminder>" in last_msg["content"][0]["text"]
-
-        # Second block should have original message
-        assert last_msg["content"][1]["type"] == "text"
-        assert last_msg["content"][1]["text"] == "What is 2+2?"
+        assert isinstance(last_msg["content"], str)
+        assert last_msg["content"].startswith("<system-reminder>")
+        assert REASONING_INSTRUCTION in last_msg["content"]
+        assert last_msg["content"].endswith("What is 2+2?")
 
     @pytest.mark.asyncio
-    async def test_prepend_instruction_to_content_array_message(self):
-        """When last message already has content array, prepend instruction block."""
+    async def test_preserves_string_whitespace_when_injecting_reasoning_reminder(self):
+        data = {
+            "messages": [
+                {"role": "user", "content": "  padded user text  "},
+            ]
+        }
+
+        result = await self.modifier.async_pre_call_hook(
+            user_api_key_dict=None,
+            cache=None,
+            data=deepcopy(data),
+            call_type="acompletion",
+        )
+
+        content = result["messages"][-1]["content"]
+        assert isinstance(content, str)
+        assert content.endswith("  padded user text  ")
+
+    @pytest.mark.asyncio
+    async def test_injects_reasoning_reminder_into_content_array_for_acompletion(self):
         data = {
             "messages": [
                 {
                     "role": "user",
                     "content": [
                         {"type": "text", "text": "Analyze this:"},
-                        {"type": "image_url", "image_url": {"url": "https://example.com/img.png"}}
-                    ]
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://example.com/img.png"},
+                        },
+                    ],
                 }
             ]
         }
 
-        result = await self.stripper.async_pre_call_hook(
+        result = await self.modifier.async_pre_call_hook(
             user_api_key_dict=None,
             cache=None,
-            data=data,
-            call_type="completion"
+            data=deepcopy(data),
+            call_type="acompletion",
+        )
+
+        content = result["messages"][-1]["content"]
+        assert isinstance(content, list)
+        assert content[0]["type"] == "text"
+        assert "<system-reminder>" in content[0]["text"]
+        assert REASONING_INSTRUCTION in content[0]["text"]
+        assert content[1]["type"] == "text"
+        assert content[1]["text"] == "Analyze this:"
+        assert content[2]["type"] == "image_url"
+        assert content[2]["image_url"]["url"] == "https://example.com/img.png"
+
+    @pytest.mark.asyncio
+    async def test_creates_string_user_message_when_none_exist_for_acompletion(self):
+        data = {
+            "messages": [{"role": "system", "content": "You are helpful."}]
+        }
+
+        result = await self.modifier.async_pre_call_hook(
+            user_api_key_dict=None,
+            cache=None,
+            data=deepcopy(data),
+            call_type="acompletion",
         )
 
         last_msg = result["messages"][-1]
         assert last_msg["role"] == "user"
-        assert isinstance(last_msg["content"], list)
-        assert len(last_msg["content"]) == 3
-
-        # First block: wrapped instruction
-        assert last_msg["content"][0]["type"] == "text"
-        assert "<system-reminder>" in last_msg["content"][0]["text"]
-
-        # Original blocks preserved
-        assert last_msg["content"][1]["type"] == "text"
-        assert last_msg["content"][1]["text"] == "Analyze this:"
-        assert last_msg["content"][2]["type"] == "image_url"
+        assert isinstance(last_msg["content"], str)
+        assert last_msg["content"].startswith("<system-reminder>")
+        assert REASONING_INSTRUCTION in last_msg["content"]
 
     @pytest.mark.asyncio
-    async def test_create_user_message_when_none_exist(self):
-        """When no user message exists, create one with wrapped instruction."""
+    async def test_removes_existing_system_reminder_before_reinserting_for_acompletion(
+        self,
+    ):
         data = {
             "messages": [
-                {"role": "system", "content": "You are helpful."}
+                {
+                    "role": "user",
+                    "content": "<SYSTEM-REMINDER>Old instruction</SYSTEM-REMINDER>\n\nUser query",
+                }
             ]
         }
 
-        result = await self.stripper.async_pre_call_hook(
+        result = await self.modifier.async_pre_call_hook(
             user_api_key_dict=None,
             cache=None,
-            data=data,
-            call_type="completion"
+            data=deepcopy(data),
+            call_type="acompletion",
         )
 
-        # Should have added a user message
-        assert len(result["messages"]) == 2
-        last_msg = result["messages"][-1]
-        assert last_msg["role"] == "user"
-        assert isinstance(last_msg["content"], list)
-        assert len(last_msg["content"]) == 1
-
-        # Should contain wrapped instruction
-        assert last_msg["content"][0]["type"] == "text"
-        assert "<system-reminder>" in last_msg["content"][0]["text"]
-        assert "You MUST begin every response" in last_msg["content"][0]["text"]
+        content = result["messages"][-1]["content"]
+        assert isinstance(content, str)
+        assert content.count("<system-reminder>") == 1
+        assert content.endswith("User query")
+        assert "Old instruction" not in content
 
     @pytest.mark.asyncio
-    async def test_skip_non_completion_call_types(self):
-        """Should not modify messages for non-completion call types."""
+    async def test_removes_existing_system_reminder_from_array_and_preserves_non_text_blocks_for_acompletion(
+        self,
+    ):
         data = {
             "messages": [
-                {"role": "user", "content": "test"}
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "<system-reminder>Old instruction</system-reminder>\n\nFirst part",
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://example.com/img.png"},
+                        },
+                        {"type": "text", "text": "Final query"},
+                    ],
+                }
             ]
         }
 
-        # Test with embeddings call type
-        result = await self.stripper.async_pre_call_hook(
+        result = await self.modifier.async_pre_call_hook(
             user_api_key_dict=None,
             cache=None,
-            data=data,
-            call_type="embeddings"
+            data=deepcopy(data),
+            call_type="acompletion",
         )
 
-        # Message should be unchanged
+        content = result["messages"][-1]["content"]
+        assert isinstance(content, list)
+        assert len(content) == 4
+        assert content[0]["type"] == "text"
+        assert "<system-reminder>" in content[0]["text"]
+        assert content[1] == {"type": "text", "text": "First part"}
+        assert content[2]["type"] == "image_url"
+        assert content[2]["image_url"]["url"] == "https://example.com/img.png"
+        assert content[3] == {"type": "text", "text": "Final query"}
+
+    @pytest.mark.asyncio
+    async def test_preserves_array_text_whitespace_when_cleaning_existing_reminder(self):
+        data = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "<system-reminder>Old instruction</system-reminder>\n\n  padded block  ",
+                        }
+                    ],
+                }
+            ]
+        }
+
+        result = await self.modifier.async_pre_call_hook(
+            user_api_key_dict=None,
+            cache=None,
+            data=deepcopy(data),
+            call_type="acompletion",
+        )
+
+        content = result["messages"][-1]["content"]
+        assert content[1] == {"type": "text", "text": "  padded block  "}
+
+    @pytest.mark.asyncio
+    async def test_skips_reasoning_injection_for_non_target_call_types(self):
+        data = {"messages": [{"role": "user", "content": "test"}]}
+
+        result = await self.modifier.async_pre_call_hook(
+            user_api_key_dict=None,
+            cache=None,
+            data=deepcopy(data),
+            call_type="embeddings",
+        )
+
         assert result["messages"][0]["content"] == "test"
 
-    @pytest.mark.asyncio
-    async def test_skip_when_instruction_disabled(self, monkeypatch):
-        """Should not modify messages when REASONING_INSTRUCTION is empty."""
-        monkeypatch.setattr("custom_callbacks.REASONING_INSTRUCTION", "")
 
-        data = {
-            "messages": [
-                {"role": "user", "content": "test"}
-            ]
-        }
+class TestReasoningStripperRequestPath:
+    def setup_method(self):
+        self.stripper = ReasoningStripper()
+
+    @pytest.mark.asyncio
+    async def test_pre_call_hook_is_noop_for_acompletion(self):
+        data = {"messages": [{"role": "user", "content": "test"}]}
 
         result = await self.stripper.async_pre_call_hook(
             user_api_key_dict=None,
             cache=None,
-            data=data,
-            call_type="completion"
+            data=deepcopy(data),
+            call_type="acompletion",
         )
 
-        # Message should be unchanged
-        assert result["messages"][0]["content"] == "test"
+        assert result == data
 
     @pytest.mark.asyncio
     async def test_post_hook_strips_reasoning_tags(self):
@@ -301,100 +384,6 @@ class TestReasoningStripperPreHook:
         )
 
         assert result.choices[0].message.content == "Visible one. Visible two."
-
-    @pytest.mark.asyncio
-    async def test_cleanup_existing_system_reminder_in_string(self):
-        """Should remove existing system-reminder blocks before adding new one."""
-        old_reminder = "<system-reminder>Old instruction here</system-reminder>\n\nUser query"
-        data = {
-            "messages": [
-                {"role": "user", "content": old_reminder}
-            ]
-        }
-
-        result = await self.stripper.async_pre_call_hook(
-            user_api_key_dict=None,
-            cache=None,
-            data=data,
-            call_type="completion"
-        )
-
-        last_msg = result["messages"][-1]
-        content = last_msg["content"]
-
-        # Should have content array
-        assert isinstance(content, list)
-        # Should have exactly 2 blocks: new instruction + original query
-        assert len(content) == 2
-
-        # First block: new instruction
-        assert "<system-reminder>" in content[0]["text"]
-        # Second block: cleaned query (old reminder removed)
-        assert content[1]["text"] == "User query"
-        assert "<system-reminder>" not in content[1]["text"]
-
-    @pytest.mark.asyncio
-    async def test_cleanup_existing_system_reminder_is_case_insensitive(self):
-        data = {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": "<SYSTEM-REMINDER>Old instruction</SYSTEM-REMINDER>\n\nUser query",
-                }
-            ]
-        }
-
-        result = await self.stripper.async_pre_call_hook(
-            user_api_key_dict=None,
-            cache=None,
-            data=data,
-            call_type="completion",
-        )
-
-        content = result["messages"][-1]["content"]
-        assert content[1]["text"] == "User query"
-        assert "SYSTEM-REMINDER" not in content[1]["text"]
-
-    @pytest.mark.asyncio
-    async def test_cleanup_existing_system_reminder_in_array(self):
-        """Should remove existing system-reminder blocks from content arrays."""
-        data = {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "<system-reminder>Old instruction</system-reminder>\n\nFirst part"},
-                        {"type": "image_url", "image_url": {"url": "https://example.com/img.png"}},
-                        {"type": "text", "text": "Final query"}
-                    ]
-                }
-            ]
-        }
-
-        result = await self.stripper.async_pre_call_hook(
-            user_api_key_dict=None,
-            cache=None,
-            data=data,
-            call_type="completion"
-        )
-
-        last_msg = result["messages"][-1]
-        content = last_msg["content"]
-
-        # Should have content array
-        assert isinstance(content, list)
-        # Should have: new instruction + original text blocks (old reminder removed) + image
-        assert len(content) == 4
-
-        # First block: new instruction
-        assert "<system-reminder>" in content[0]["text"]
-        # Second block: first text with old reminder removed
-        assert content[1]["text"] == "First part"
-        # Third block: image preserved
-        assert content[2]["type"] == "image_url"
-        # Fourth block: final query
-        assert content[3]["text"] == "Final query"
-
 
 class TestReasoningStreamFilter:
     def test_removes_reasoning_when_tags_are_in_one_chunk(self):
@@ -542,6 +531,22 @@ class TestReasoningStripperStreamingHook:
 
         assert "".join(_choice_content(choice) or "" for chunk in result for choice in chunk["choices"]) == "Literal <rea"
         assert result[-1]["choices"][0]["finish_reason"] == "stop"
+
+    @pytest.mark.asyncio
+    async def test_streaming_hook_flushes_tail_when_object_finish_chunk_has_no_delta(self):
+        chunks = [
+            SimpleNamespace(
+                choices=[SimpleNamespace(index=0, delta=SimpleNamespace(content="Literal <rea"))]
+            ),
+            SimpleNamespace(
+                choices=[SimpleNamespace(index=0, finish_reason="stop")]
+            ),
+        ]
+
+        result = await _collect_streaming_hook(self.stripper, chunks)
+
+        assert "".join(_chunk_content(chunk) or "" for chunk in result) == "Literal <rea"
+        assert result[-1].choices[0].finish_reason == "stop"
 
     @pytest.mark.asyncio
     async def test_streaming_hook_strips_dict_shaped_choice_delta(self):

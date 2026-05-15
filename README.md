@@ -1,8 +1,8 @@
 # super_proxy
 
 LiteLLM proxy в роли OpenAI-совместимого шлюза с тремя независимыми дополнениями:
-1. **`RequestModifier`** — `async_pre_call_hook`, добавляет system-промт и при необходимости дополняет последнее user-сообщение.
-2. **`ReasoningStripper`** — `async_pre_call_hook` + `async_post_call_success_hook` + `async_post_call_streaming_iterator_hook`: просит модель оборачивать reasoning в XML-тег и вырезает этот блок из non-streaming и streaming-ответов перед отдачей клиенту.
+1. **`RequestModifier`** — `async_pre_call_hook`, добавляет system-промт, при необходимости дополняет последнее user-сообщение и внедряет reasoning-instruction в последнее `user`-сообщение.
+2. **`ReasoningStripper`** — `async_post_call_success_hook` + `async_post_call_streaming_iterator_hook`: вырезает `<reasoning>...</reasoning>` из non-streaming и streaming-ответов перед отдачей клиенту.
 3. **`JsonlLogger`** — `async_log_success_event` / `async_log_failure_event`, пишет логи построчно в `logs/requests.jsonl`.
 
 Любое имя модели на входе (`model: "*"` в `config.yaml`) пересылается в один **hosted vLLM**-бэкенд. Каждый компонент включается/выключается отдельной строкой в `config.yaml` (`litellm_settings.callbacks`).
@@ -12,7 +12,7 @@ LiteLLM proxy в роли OpenAI-совместимого шлюза с трем
 ```
 super_proxy/
 ├── config.yaml             # маршрутизация на vLLM + регистрация callback'ов
-├── custom_callbacks.py     # RequestModifier и JsonlLogger
+├── custom_callbacks.py     # RequestModifier, ReasoningStripper и JsonlLogger
 ├── requirements.txt        # litellm[proxy]>=1.83.0
 ├── .env.example            # шаблон секретов (по умолчанию пуст)
 ├── docs/
@@ -60,7 +60,7 @@ curl -s http://localhost:4000/v1/chat/completions \
   -d '{"model":"any-name-you-like","messages":[{"role":"user","content":"Hello"}]}' | jq .
 ```
 
-Имя модели в `model` можно слать любое — wildcard `*` отправит запрос на vLLM. После ответа в `logs/requests.jsonl` появится строка с полным [Standard Logging Payload](https://docs.litellm.ai/docs/proxy/logging_spec) — `messages` (включая внедрённый system), `response`, `response_cost`, `total_tokens`, тайминги, error_information и т.д.
+Имя модели в `model` можно слать любое — wildcard `*` отправит запрос на vLLM. После ответа в `logs/requests.jsonl` появится строка с полным [Standard Logging Payload](https://docs.litellm.ai/docs/proxy/logging_spec) — `messages` (включая модифицированное последнее `user`-сообщение), `response`, `response_cost`, `total_tokens`, тайминги, `error_information` и т.д.
 
 ## Где править правила модификации
 
@@ -81,11 +81,11 @@ curl -s http://localhost:4000/v1/chat/completions \
 В `custom_callbacks.py`, секция «Удаление reasoning-тега из ответа модели»:
 
 - **`REASONING_TAG`** — имя XML-тега (по умолчанию `reasoning`).
-- **`REASONING_INSTRUCTION`** — текст, добавляемый в последнее `user`-сообщение как первый text-блок внутри `<system-reminder>...</system-reminder>`. Пустая строка выключает добавление инструкции, но очистка ответа продолжит работать.
+- **`REASONING_INSTRUCTION`** — текст reasoning-протокола, который `RequestModifier` добавляет в последнее `user`-сообщение. Для строкового `content` reminder встраивается в строку напрямую. Для `content`-массивов callback добавляет первый text-блок с reminder и сохраняет остальные блоки.
 
-Перед отправкой запроса callback удаляет старые `<system-reminder>...</system-reminder>` блоки из последнего `user`-сообщения и добавляет свежую инструкцию. Это предотвращает накопление одинаковых reminder-блоков в агентских сценариях.
+Reasoning-instruction впрыскивается для `call_type` из `completion`, `text_completion`, `acompletion`. Это покрывает живой proxy path LiteLLM, где chat completion обычно проходит как `acompletion`.
 
-После ответа модели callback удаляет `<reasoning>...</reasoning>` из non-streaming ответов и из streaming-чанков. Потоковая очистка работает с тегами, разорванными между чанками, и сохраняет служебные чанки с `role`, `tool_calls`, `usage` и `finish_reason`.
+`ReasoningStripper` только очищает ответы модели: удаляет `<reasoning>...</reasoning>` из non-streaming ответов и из streaming-чанков. Потоковая очистка работает с тегами, разорванными между чанками, и сохраняет служебные чанки с `role`, `tool_calls`, `usage` и `finish_reason`.
 
 Если модель открыла `<reasoning>`, но не закрыла тег, содержимое reasoning не отдаётся клиенту.
 
