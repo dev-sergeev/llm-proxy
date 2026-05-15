@@ -3,3 +3,4 @@
 logs/*.jsonl
 __pycache__/
 *.pyc
+.worktrees/
