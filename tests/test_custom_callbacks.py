@@ -9,6 +9,39 @@ from custom_callbacks import (
 )
 
 
+def _stream_chunk(content=None, finish_reason=None, role=None, usage=None):
+    delta = SimpleNamespace()
+    if content is not None:
+        delta.content = content
+    if role is not None:
+        delta.role = role
+
+    choice = SimpleNamespace(delta=delta, finish_reason=finish_reason, index=0)
+    chunk = SimpleNamespace(choices=[choice])
+    if usage is not None:
+        chunk.usage = usage
+    return chunk
+
+
+async def _collect_streaming_hook(stripper, chunks):
+    async def source():
+        for chunk in chunks:
+            yield chunk
+
+    return [
+        chunk
+        async for chunk in stripper.async_post_call_streaming_iterator_hook(
+            user_api_key_dict=None,
+            response=source(),
+            request_data={},
+        )
+    ]
+
+
+def _chunk_content(chunk):
+    return getattr(chunk.choices[0].delta, "content", None)
+
+
 class TestReasoningStripperPreHook:
     """Test ReasoningStripper.async_pre_call_hook message transformation."""
 
@@ -319,3 +352,67 @@ class TestReasoningStreamFilter:
         visible += stream_filter.flush()
 
         assert visible == "The answer is 42."
+
+
+class TestReasoningStripperStreamingHook:
+    def setup_method(self):
+        self.stripper = ReasoningStripper()
+
+    @pytest.mark.asyncio
+    async def test_streaming_hook_strips_reasoning_split_across_chunks(self):
+        chunks = [
+            _stream_chunk("<rea", role="assistant"),
+            _stream_chunk("soning>private notes"),
+            _stream_chunk("</rea"),
+            _stream_chunk("soning>\n\nThe answer"),
+            _stream_chunk(" is 42."),
+            _stream_chunk(finish_reason="stop"),
+        ]
+
+        result = await _collect_streaming_hook(self.stripper, chunks)
+
+        assert "".join(_chunk_content(chunk) or "" for chunk in result) == (
+            "The answer is 42."
+        )
+        assert result[0].choices[0].delta.role == "assistant"
+        assert result[-1].choices[0].finish_reason == "stop"
+
+    @pytest.mark.asyncio
+    async def test_streaming_hook_passes_through_text_without_reasoning(self):
+        chunks = [
+            _stream_chunk("Hello ", role="assistant"),
+            _stream_chunk("world"),
+            _stream_chunk(finish_reason="stop"),
+        ]
+
+        result = await _collect_streaming_hook(self.stripper, chunks)
+
+        assert "".join(_chunk_content(chunk) or "" for chunk in result) == "Hello world"
+        assert result[0].choices[0].delta.role == "assistant"
+        assert result[-1].choices[0].finish_reason == "stop"
+
+    @pytest.mark.asyncio
+    async def test_streaming_hook_preserves_finish_and_usage_chunk(self):
+        usage = {"completion_tokens": 8, "prompt_tokens": 4, "total_tokens": 12}
+        chunks = [
+            _stream_chunk("<reasoning>private</reasoning>\n\nVisible"),
+            _stream_chunk(finish_reason="stop", usage=usage),
+        ]
+
+        result = await _collect_streaming_hook(self.stripper, chunks)
+
+        assert "".join(_chunk_content(chunk) or "" for chunk in result) == "Visible"
+        assert result[-1].choices[0].finish_reason == "stop"
+        assert result[-1].usage == usage
+
+    @pytest.mark.asyncio
+    async def test_streaming_hook_flushes_held_visible_tail_on_finish(self):
+        chunks = [
+            _stream_chunk("Literal <rea", role="assistant"),
+            _stream_chunk(finish_reason="stop"),
+        ]
+
+        result = await _collect_streaming_hook(self.stripper, chunks)
+
+        assert "".join(_chunk_content(chunk) or "" for chunk in result) == "Literal <rea"
+        assert result[-1].choices[0].finish_reason == "stop"

@@ -221,6 +221,35 @@ _SYSTEM_REMINDER_RE = _xml_tag_re("system-reminder")
 _SYSTEM_REMINDER_BLOCK_TEXT = f"<system-reminder>{REASONING_INSTRUCTION}</system-reminder>\n\n"
 _INSTRUCTION_BLOCK = {"type": "text", "text": _SYSTEM_REMINDER_BLOCK_TEXT}
 
+
+def _stream_choice_index(choice: Any, fallback: int) -> int:
+    index = getattr(choice, "index", fallback)
+    if isinstance(index, int):
+        return index
+    return fallback
+
+
+def _get_delta_content(choice: Any) -> Optional[str]:
+    delta = getattr(choice, "delta", None)
+    if isinstance(delta, dict):
+        content = delta.get("content")
+    else:
+        content = getattr(delta, "content", None)
+    if isinstance(content, str):
+        return content
+    return None
+
+
+def _set_delta_content(choice: Any, content: str) -> None:
+    delta = getattr(choice, "delta", None)
+    if delta is None:
+        return
+    if isinstance(delta, dict):
+        delta["content"] = content
+        return
+    setattr(delta, "content", content)
+
+
 class ReasoningStripper(CustomLogger):
     async def async_pre_call_hook(
         self,
@@ -304,6 +333,40 @@ class ReasoningStripper(CustomLogger):
             if isinstance(content, str):
                 message.content = _REASONING_RE.sub("", content)
         return response
+
+    async def async_post_call_streaming_iterator_hook(
+        self,
+        user_api_key_dict: UserAPIKeyAuth,
+        response: Any,
+        request_data: dict,
+    ) -> AsyncGenerator[Any, None]:
+        filters: dict[int, ReasoningStreamFilter] = {}
+
+        async for chunk in response:
+            try:
+                choices = getattr(chunk, "choices", None) or []
+                for position, choice in enumerate(choices):
+                    choice_index = _stream_choice_index(choice, position)
+                    stream_filter = filters.setdefault(
+                        choice_index,
+                        ReasoningStreamFilter(REASONING_TAG),
+                    )
+
+                    content = _get_delta_content(choice)
+                    if content is not None:
+                        _set_delta_content(choice, stream_filter.feed(content))
+
+                    if getattr(choice, "finish_reason", None) is not None:
+                        tail = stream_filter.flush()
+                        if tail:
+                            current = _get_delta_content(choice) or ""
+                            _set_delta_content(choice, current + tail)
+                        filters.pop(choice_index, None)
+            except Exception:
+                yield chunk
+                continue
+
+            yield chunk
 
 
 reasoning_stripper = ReasoningStripper()
