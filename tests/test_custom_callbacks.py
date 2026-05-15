@@ -301,3 +301,11 @@ class TestReasoningStreamFilter:
         visible += stream_filter.flush()
 
         assert visible == "Literal <rea"
+
+    def test_preserves_visible_whitespace_after_inline_reasoning(self):
+        stream_filter = ReasoningStreamFilter("reasoning")
+
+        visible = stream_filter.feed("alpha<reasoning>x</reasoning> beta")
+        visible += stream_filter.flush()
+
+        assert visible == "alpha beta"

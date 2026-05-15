@@ -129,6 +129,7 @@ class ReasoningStreamFilter:
         self._buffer = ""
         self._inside_reasoning = False
         self._drop_leading_ws = False
+        self._emitted_visible = False
 
     def feed(self, text: str) -> str:
         if not text:
@@ -146,7 +147,7 @@ class ReasoningStreamFilter:
 
                 self._buffer = self._buffer[closing_match.end():]
                 self._inside_reasoning = False
-                self._drop_leading_ws = True
+                self._drop_leading_ws = not self._emitted_visible
                 continue
 
             if self._drop_leading_ws:
@@ -161,11 +162,17 @@ class ReasoningStreamFilter:
                 visible_parts.append(visible)
                 break
 
-            visible_parts.append(self._buffer[:opening_match.start()])
+            visible = self._buffer[:opening_match.start()]
+            visible_parts.append(visible)
+            if visible:
+                self._emitted_visible = True
             self._buffer = self._buffer[opening_match.end():]
             self._inside_reasoning = True
 
-        return "".join(visible_parts)
+        visible = "".join(visible_parts)
+        if visible:
+            self._emitted_visible = True
+        return visible
 
     def flush(self) -> str:
         if self._inside_reasoning:
@@ -180,6 +187,8 @@ class ReasoningStreamFilter:
 
         visible = self._buffer
         self._buffer = ""
+        if visible:
+            self._emitted_visible = True
         return visible
 
     def _inside_pending_suffix(self) -> str:
