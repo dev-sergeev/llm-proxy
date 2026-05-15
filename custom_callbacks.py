@@ -377,7 +377,6 @@ class ReasoningStripper(CustomLogger):
                 try:
                     choice_index = _stream_choice_index(choice, position)
                     content = _get_delta_content(choice)
-                    finish_reason = _get_finish_reason(choice)
                     can_write_content = _can_set_delta_content(choice)
                 except Exception:
                     continue
@@ -394,6 +393,11 @@ class ReasoningStripper(CustomLogger):
                         continue
                     filtered_content = stream_filter.feed(content)
                     _try_set_delta_content(choice, filtered_content)
+
+                try:
+                    finish_reason = _get_finish_reason(choice)
+                except Exception:
+                    continue
 
                 if finish_reason is not None:
                     if can_write_content:

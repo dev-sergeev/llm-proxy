@@ -51,6 +51,17 @@ def _choice_content(choice):
     return getattr(choice.delta, "content", None)
 
 
+class _ChoiceWithBrokenFinishReason:
+    index = 0
+
+    def __init__(self, content):
+        self.delta = SimpleNamespace(content=content)
+
+    @property
+    def finish_reason(self):
+        raise RuntimeError("finish reason unavailable")
+
+
 class TestReasoningStripperPreHook:
     """Test ReasoningStripper.async_pre_call_hook message transformation."""
 
@@ -495,3 +506,19 @@ class TestReasoningStripperStreamingHook:
 
         assert "".join(contents_by_index[0]) == "Visible"
         assert "".join(contents_by_index[1]) == "Alpha Beta"
+
+    @pytest.mark.asyncio
+    async def test_streaming_hook_strips_content_when_finish_reason_lookup_raises(self):
+        chunks = [
+            SimpleNamespace(
+                choices=[
+                    _ChoiceWithBrokenFinishReason(
+                        "<reasoning>x</reasoning>Visible"
+                    )
+                ]
+            ),
+        ]
+
+        result = await _collect_streaming_hook(self.stripper, chunks)
+
+        assert "".join(_chunk_content(chunk) or "" for chunk in result) == "Visible"
