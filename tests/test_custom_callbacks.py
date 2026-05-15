@@ -231,6 +231,39 @@ class TestReasoningStripperPreHook:
         assert "<reasoning>" not in result.choices[0].message.content
 
     @pytest.mark.asyncio
+    async def test_post_hook_strips_dict_shaped_response(self):
+        response = {
+            "choices": [
+                {"message": {"content": "<reasoning>secret</reasoning>Visible"}}
+            ]
+        }
+
+        result = await self.stripper.async_post_call_success_hook(
+            data={},
+            user_api_key_dict=None,
+            response=response,
+        )
+
+        assert result["choices"][0]["message"]["content"] == "Visible"
+
+    @pytest.mark.asyncio
+    async def test_post_hook_preserves_inline_whitespace_after_reasoning(self):
+        mock_response = MagicMock()
+        mock_choice = MagicMock()
+        mock_message = MagicMock()
+        mock_message.content = "alpha<reasoning>x</reasoning> beta"
+        mock_choice.message = mock_message
+        mock_response.choices = [mock_choice]
+
+        result = await self.stripper.async_post_call_success_hook(
+            data={},
+            user_api_key_dict=None,
+            response=mock_response,
+        )
+
+        assert result.choices[0].message.content == "alpha beta"
+
+    @pytest.mark.asyncio
     async def test_post_hook_drops_unclosed_reasoning_block(self):
         mock_response = MagicMock()
         mock_choice = MagicMock()
@@ -299,6 +332,28 @@ class TestReasoningStripperPreHook:
         # Second block: cleaned query (old reminder removed)
         assert content[1]["text"] == "User query"
         assert "<system-reminder>" not in content[1]["text"]
+
+    @pytest.mark.asyncio
+    async def test_cleanup_existing_system_reminder_is_case_insensitive(self):
+        data = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "<SYSTEM-REMINDER>Old instruction</SYSTEM-REMINDER>\n\nUser query",
+                }
+            ]
+        }
+
+        result = await self.stripper.async_pre_call_hook(
+            user_api_key_dict=None,
+            cache=None,
+            data=data,
+            call_type="completion",
+        )
+
+        content = result["messages"][-1]["content"]
+        assert content[1]["text"] == "User query"
+        assert "SYSTEM-REMINDER" not in content[1]["text"]
 
     @pytest.mark.asyncio
     async def test_cleanup_existing_system_reminder_in_array(self):
@@ -475,6 +530,18 @@ class TestReasoningStripperStreamingHook:
 
         assert "".join(_chunk_content(chunk) or "" for chunk in result) == "Literal <rea"
         assert result[-1].choices[0].finish_reason == "stop"
+
+    @pytest.mark.asyncio
+    async def test_streaming_hook_flushes_tail_when_finish_chunk_has_no_delta(self):
+        chunks = [
+            {"choices": [{"index": 0, "delta": {"content": "Literal <rea"}}]},
+            {"choices": [{"index": 0, "finish_reason": "stop"}]},
+        ]
+
+        result = await _collect_streaming_hook(self.stripper, chunks)
+
+        assert "".join(_choice_content(choice) or "" for chunk in result for choice in chunk["choices"]) == "Literal <rea"
+        assert result[-1]["choices"][0]["finish_reason"] == "stop"
 
     @pytest.mark.asyncio
     async def test_streaming_hook_strips_dict_shaped_choice_delta(self):

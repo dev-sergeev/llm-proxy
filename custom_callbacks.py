@@ -3,7 +3,7 @@ import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncGenerator, Literal, Optional
+from typing import Any, AsyncGenerator, Iterable, Literal, Optional
 
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.proxy.proxy_server import DualCache, UserAPIKeyAuth
@@ -99,7 +99,7 @@ REASONING_INSTRUCTION = (
 
 def _xml_tag_re(tag: str) -> re.Pattern:
     return re.compile(
-        rf"<{re.escape(tag)}\b[^>]*>.*?</{re.escape(tag)}\s*>\s*",
+        rf"<{re.escape(tag)}\b[^>]*>.*?</{re.escape(tag)}\s*>",
         re.DOTALL | re.IGNORECASE,
     )
 
@@ -215,15 +215,28 @@ class ReasoningStreamFilter:
 
 
 _REASONING_RE = _xml_tag_re(REASONING_TAG)
+_REASONING_WITH_SEPARATOR_RE = re.compile(
+    rf"<{re.escape(REASONING_TAG)}\b[^>]*>.*?</{re.escape(REASONING_TAG)}\s*>"
+    r"[ \t]*(?:\r?\n)+\s*",
+    re.DOTALL | re.IGNORECASE,
+)
 _UNCLOSED_REASONING_RE = re.compile(
     rf"<{re.escape(REASONING_TAG)}\b[^>]*>.*\Z",
     re.DOTALL | re.IGNORECASE,
 )
 _SYSTEM_REMINDER_RE = _xml_tag_re("system-reminder")
+_REASONING_OPENING_START_RE = re.compile(
+    rf"\A\s*<{re.escape(REASONING_TAG)}\b[^>]*>",
+    re.DOTALL | re.IGNORECASE,
+)
 
 
 def _strip_reasoning_text(content: str) -> str:
-    return _UNCLOSED_REASONING_RE.sub("", _REASONING_RE.sub("", content))
+    stripped = _REASONING_WITH_SEPARATOR_RE.sub("", content)
+    stripped = _REASONING_RE.sub("", stripped)
+    if _REASONING_OPENING_START_RE.match(content):
+        stripped = stripped.lstrip()
+    return _UNCLOSED_REASONING_RE.sub("", stripped)
 
 
 # Constant block prepended to user messages (built once, used many times)
@@ -239,6 +252,14 @@ def _stream_choice_index(choice: Any, fallback: int) -> int:
     if isinstance(index, int):
         return index
     return fallback
+
+
+def _get_chunk_choices(chunk: Any) -> Iterable[Any]:
+    if isinstance(chunk, dict):
+        choices = chunk.get("choices")
+    else:
+        choices = getattr(chunk, "choices", None)
+    return choices or []
 
 
 def _get_delta_content(choice: Any) -> Optional[str]:
@@ -282,10 +303,55 @@ def _try_set_delta_content(choice: Any, content: str) -> bool:
     return True
 
 
+def _try_ensure_dict_delta_content(choice: Any, content: str) -> bool:
+    if not isinstance(choice, dict):
+        return False
+    delta = choice.setdefault("delta", {})
+    if not isinstance(delta, dict):
+        return False
+    delta["content"] = content
+    return True
+
+
 def _get_finish_reason(choice: Any) -> Any:
     if isinstance(choice, dict):
         return choice.get("finish_reason")
     return getattr(choice, "finish_reason", None)
+
+
+def _get_response_choices(response: Any) -> Iterable[Any]:
+    if isinstance(response, dict):
+        choices = response.get("choices")
+    else:
+        choices = getattr(response, "choices", None)
+    return choices or []
+
+
+def _get_message_content(choice: Any) -> Optional[str]:
+    if isinstance(choice, dict):
+        message = choice.get("message")
+    else:
+        message = getattr(choice, "message", None)
+    if isinstance(message, dict):
+        content = message.get("content")
+    else:
+        content = getattr(message, "content", None)
+    if isinstance(content, str):
+        return content
+    return None
+
+
+def _set_message_content(choice: Any, content: str) -> None:
+    if isinstance(choice, dict):
+        message = choice.get("message")
+    else:
+        message = getattr(choice, "message", None)
+    if message is None:
+        return
+    if isinstance(message, dict):
+        message["content"] = content
+        return
+    setattr(message, "content", content)
 
 
 class ReasoningStripper(CustomLogger):
@@ -322,11 +388,7 @@ class ReasoningStripper(CustomLogger):
             content = user_msg.get("content")
 
             if isinstance(content, str):
-                # Only apply regex if system-reminder tag is present
-                if "<system-reminder>" in content:
-                    cleaned = _SYSTEM_REMINDER_RE.sub("", content).strip()
-                else:
-                    cleaned = content.strip()
+                cleaned = _SYSTEM_REMINDER_RE.sub("", content).strip()
                 # Convert to content array
                 user_msg["content"] = [
                     _INSTRUCTION_BLOCK,
@@ -338,11 +400,11 @@ class ReasoningStripper(CustomLogger):
                 for block in content:
                     if block.get("type") == "text":
                         text = block.get("text", "")
-                        if "<system-reminder>" in text:
-                            cleaned = _SYSTEM_REMINDER_RE.sub("", text).strip()
+                        cleaned = _SYSTEM_REMINDER_RE.sub("", text).strip()
+                        if cleaned != text.strip():
                             if cleaned:
                                 filtered_content.append({"type": "text", "text": cleaned})
-                        else:
+                        elif text:
                             filtered_content.append(block)
                     else:
                         filtered_content.append(block)
@@ -365,11 +427,10 @@ class ReasoningStripper(CustomLogger):
         user_api_key_dict: UserAPIKeyAuth,
         response,
     ):
-        for choice in getattr(response, "choices", None) or []:
-            message = getattr(choice, "message", None)
-            content = getattr(message, "content", None)
+        for choice in _get_response_choices(response):
+            content = _get_message_content(choice)
             if isinstance(content, str):
-                message.content = _strip_reasoning_text(content)
+                _set_message_content(choice, _strip_reasoning_text(content))
         return response
 
     async def async_post_call_streaming_iterator_hook(
@@ -381,7 +442,7 @@ class ReasoningStripper(CustomLogger):
         filters: dict[int, ReasoningStreamFilter] = {}
 
         async for chunk in response:
-            choices = getattr(chunk, "choices", None) or []
+            choices = _get_chunk_choices(chunk)
             for position, choice in enumerate(choices):
                 try:
                     choice_index = _stream_choice_index(choice, position)
@@ -409,13 +470,14 @@ class ReasoningStripper(CustomLogger):
                     continue
 
                 if finish_reason is not None:
-                    if can_write_content:
-                        current = _get_delta_content(choice) or ""
-                        if _try_set_delta_content(choice, current):
-                            tail = stream_filter.flush()
-                            if tail:
-                                _try_set_delta_content(choice, current + tail)
-                        filters.pop(choice_index, None)
+                    current = _get_delta_content(choice) or ""
+                    tail = stream_filter.flush()
+                    if tail:
+                        if can_write_content:
+                            _try_set_delta_content(choice, current + tail)
+                        else:
+                            _try_ensure_dict_delta_content(choice, current + tail)
+                    filters.pop(choice_index, None)
 
             yield chunk
 
